@@ -1455,6 +1455,26 @@ def extract_json(text: str) -> object:
     raise ExtractionError("The model did not return valid JSON.")
 
 
+def temp_dir_parent() -> str | None:
+    candidates = [
+        os.environ.get("RECEIPT_TMP_DIR", "").strip(),
+        tempfile.gettempdir(),
+        "/tmp",
+        "/private/tmp",
+    ]
+    for raw_path in candidates:
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        if path.is_dir() and os.access(path, os.W_OK):
+            return str(path)
+    return None
+
+
 def read_pdf_text(path: Path) -> str:
     text = ""
     try:
@@ -1475,7 +1495,7 @@ def read_pdf_text(path: Path) -> str:
 
 def read_pdf_ocr_text(path: Path) -> str:
     size = os.environ.get("PDF_OCR_RENDER_SIZE", "2400")
-    with tempfile.TemporaryDirectory(prefix="receipt-pdf-ocr-", dir="/private/tmp") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="receipt-pdf-ocr-", dir=temp_dir_parent()) as temp_dir:
         try:
             result = subprocess.run(
                 ["qlmanage", "-t", "-s", size, "-o", temp_dir, str(path)],
@@ -1607,7 +1627,7 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
         )
 
     psms = [item.strip() for item in os.environ.get("OCR_PSMS", "6,11").split(",") if item.strip()]
-    with tempfile.TemporaryDirectory(prefix="receipt-image-ocr-", dir="/private/tmp") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="receipt-image-ocr-", dir=temp_dir_parent()) as temp_dir:
         for variant_name, image in variants:
             image_path = Path(temp_dir) / f"{variant_name}.png"
             image.save(image_path)
