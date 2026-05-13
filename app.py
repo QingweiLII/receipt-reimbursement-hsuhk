@@ -39,6 +39,8 @@ DEFAULT_OCR_SMALL_MAX_LONG_EDGE = "650"
 DEFAULT_OCR_PSMS = "6,11"
 DEFAULT_OCR_MAX_CANDIDATES = "3"
 DEFAULT_OCR_VARIANTS = "gray"
+DEFAULT_OCR_ORIENTATION_MAX_LONG_EDGE = "1200"
+DEFAULT_OCR_ORIENTATION_PSMS = "6"
 DEFAULT_LLM_TIMEOUT_SECONDS = "45"
 DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS = "120"
 
@@ -1665,6 +1667,23 @@ def crop_for_ocr(image):
     return image.crop((left, top, right, bottom))
 
 
+def run_ocr_candidate_images(
+    candidates: list[tuple[int, str, str]],
+    variants: list[tuple[str, object]],
+    psms: list[str],
+) -> None:
+    if not variants:
+        return
+    with tempfile.TemporaryDirectory(prefix="receipt-image-ocr-", dir=temp_dir_parent()) as temp_dir:
+        for variant_name, image in variants:
+            image_path = Path(temp_dir) / f"{variant_name}.png"
+            image.save(image_path)
+            for psm in psms:
+                text, _, code = run_tesseract(image_path, psm)
+                if text and code == 0:
+                    candidates.append((ocr_score(text), f"{variant_name} psm {psm}", text))
+
+
 def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
     candidates: list[tuple[int, str, str]] = []
     raw_text = ""
@@ -1685,10 +1704,12 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
 
     try:
         with Image.open(path) as opened:
-            base = ImageOps.exif_transpose(opened).convert("RGB")
+            raw_base = opened.convert("RGB")
+            exif_base = ImageOps.exif_transpose(opened).convert("RGB")
     except Exception:
         return candidates
 
+    base = exif_base
     base = resize_for_ocr(crop_for_ocr(base))
     enabled_variants = {
         item.strip().lower()
@@ -1714,14 +1735,29 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
             variants.append(("rgb-rot270", base.rotate(270, expand=True)))
 
     psms = [item.strip() for item in os.environ.get("OCR_PSMS", DEFAULT_OCR_PSMS).split(",") if item.strip()]
-    with tempfile.TemporaryDirectory(prefix="receipt-image-ocr-", dir=temp_dir_parent()) as temp_dir:
-        for variant_name, image in variants:
-            image_path = Path(temp_dir) / f"{variant_name}.png"
-            image.save(image_path)
-            for psm in psms:
-                text, _, code = run_tesseract(image_path, psm)
-                if text and code == 0:
-                    candidates.append((ocr_score(text), f"{variant_name} psm {psm}", text))
+    run_ocr_candidate_images(candidates, variants, psms)
+
+    if not candidates and env_flag("OCR_ORIENTATION_FALLBACK", True):
+        orientation_max = int(
+            os.environ.get("OCR_ORIENTATION_MAX_LONG_EDGE", DEFAULT_OCR_ORIENTATION_MAX_LONG_EDGE)
+        )
+        orientation_psms = [
+            item.strip()
+            for item in os.environ.get("OCR_ORIENTATION_PSMS", DEFAULT_OCR_ORIENTATION_PSMS).split(",")
+            if item.strip()
+        ]
+        orientation_variants = []
+        for label, image in [
+            ("exif-nocrop", exif_base),
+            ("raw", raw_base),
+            ("raw-rot90", raw_base.rotate(90, expand=True)),
+            ("raw-rot270", raw_base.rotate(270, expand=True)),
+            ("raw-rot180", raw_base.rotate(180, expand=True)),
+        ]:
+            small = resize_to_max_long_edge(image, orientation_max)
+            orientation_variants.append((label, ImageOps.autocontrast(ImageOps.grayscale(small))))
+        print(f"OCR orientation fallback for {path.name} with {len(orientation_variants)} variant(s).", flush=True)
+        run_ocr_candidate_images(candidates, orientation_variants, orientation_psms)
     return candidates
 
 

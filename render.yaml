@@ -45,6 +45,12 @@ services:
         value: 20
       - key: OCR_MAX_CANDIDATES
         value: 3
+      - key: OCR_ORIENTATION_FALLBACK
+        value: true
+      - key: OCR_ORIENTATION_MAX_LONG_EDGE
+        value: 1200
+      - key: OCR_ORIENTATION_PSMS
+        value: 6
       - key: STORAGE_PROVIDER
         value: user_google_drive
       - key: GOOGLE_DRIVE_FOLDER_NAME
