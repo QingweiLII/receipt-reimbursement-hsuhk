@@ -3032,8 +3032,9 @@ def page_html() -> bytes:
       return data;
     }}
 
-    async function pollUploadJob(jobId) {{
+    async function pollUploadJob(jobId, requestId = "") {{
       let pollFailures = 0;
+      let restartAttempts = 0;
       while (true) {{
         let data;
         try {{
@@ -3041,9 +3042,20 @@ def page_html() -> bytes:
           data = await readJsonResponse(res);
           pollFailures = 0;
         }} catch (error) {{
+          const errorText = error.message || String(error);
+          if (requestId && /Upload job not found/i.test(errorText) && restartAttempts < 2) {{
+            restartAttempts += 1;
+            setMessage(`Upload job disappeared after a server restart. Re-uploading selected files... (${{restartAttempts}}/2)`);
+            const restarted = await startUploadWithRetry(requestId);
+            if (!restarted.job_id) throw new Error(restarted.error || "Could not restart upload.");
+            jobId = restarted.job_id;
+            pollFailures = 0;
+            await sleep(1800);
+            continue;
+          }}
           pollFailures += 1;
           if (pollFailures >= 5) {{
-            throw new Error(`Could not check upload progress: ${{error.message || String(error)}}`);
+            throw new Error(`Could not check upload progress: ${{errorText}}`);
           }}
           setMessage(`Still processing. Reconnecting to upload status... (${{pollFailures}}/5)`);
           await sleep(2500);
@@ -3267,8 +3279,9 @@ def page_html() -> bytes:
       uploadButton.disabled = true;
       setMessage(`Processing ${{totalSelectedCount()}} file(s)...`);
       try {{
-        const started = await startUploadWithRetry(uploadRequestId());
-        const data = started.job_id ? await pollUploadJob(started.job_id) : started;
+        const requestId = uploadRequestId();
+        const started = await startUploadWithRetry(requestId);
+        const data = started.job_id ? await pollUploadJob(started.job_id, requestId) : started;
         if (!data.ok) throw new Error(data.error || "Upload failed.");
         latestBatchId = data.batch_id || "";
         latestWorkbookUrl = data.workbook || "";
