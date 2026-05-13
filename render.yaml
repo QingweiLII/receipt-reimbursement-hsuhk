@@ -22,7 +22,7 @@ services:
       - key: OCR_FALLBACK_ON_LLM_ERROR
         value: true
       - key: RECEIPT_PROCESS_TIMEOUT_SECONDS
-        value: 80
+        value: 120
       - key: EXCHANGE_RATE_PROVIDER
         value: frankfurter
       - key: FX_BASE_URL

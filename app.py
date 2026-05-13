@@ -32,6 +32,13 @@ CLIENTS_DIR = DATA_DIR / "clients"
 RECORDS_PATH = DATA_DIR / "records.json"
 WORKBOOK_PATH = DATA_DIR / "reimbursements.xlsx"
 PAGE_PATHS = {"/", "/hsuhk-receipt-report-page", "/hsuhk receipt report page", "/hsuhk-receipt-report"}
+DEFAULT_OCR_TIMEOUT_SECONDS = "20"
+DEFAULT_OCR_TARGET_MIN_EDGE = "900"
+DEFAULT_OCR_MAX_LONG_EDGE = "2000"
+DEFAULT_OCR_PSMS = "6"
+DEFAULT_OCR_MAX_CANDIDATES = "2"
+DEFAULT_LLM_TIMEOUT_SECONDS = "45"
+DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS = "120"
 
 HEADERS = [
     "Date",
@@ -1534,7 +1541,7 @@ def run_tesseract(path: Path, psm: str | None = None) -> tuple[str, str, int]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=float(os.environ.get("OCR_TIMEOUT_SECONDS", "30")),
+            timeout=float(os.environ.get("OCR_TIMEOUT_SECONDS", DEFAULT_OCR_TIMEOUT_SECONDS)),
         )
     except FileNotFoundError:
         raise ExtractionError("MiniMax provider needs local OCR for images, but tesseract is not installed.")
@@ -1580,8 +1587,8 @@ def ocr_score(text: str) -> int:
 
 def resize_for_ocr(image, target_min: int | None = None):
     if target_min is None:
-        target_min = int(os.environ.get("OCR_TARGET_MIN_EDGE", "1200"))
-    max_long = int(os.environ.get("OCR_MAX_LONG_EDGE", "3600"))
+        target_min = int(os.environ.get("OCR_TARGET_MIN_EDGE", DEFAULT_OCR_TARGET_MIN_EDGE))
+    max_long = int(os.environ.get("OCR_MAX_LONG_EDGE", DEFAULT_OCR_MAX_LONG_EDGE))
     min_edge = max(1, min(image.size))
     max_edge = max(image.size)
     scale = 1.0
@@ -1637,7 +1644,7 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
         if "rot270" in enabled_variants or "rotations" in enabled_variants:
             variants.append(("rgb-rot270", base.rotate(270, expand=True)))
 
-    psms = [item.strip() for item in os.environ.get("OCR_PSMS", "6,11").split(",") if item.strip()]
+    psms = [item.strip() for item in os.environ.get("OCR_PSMS", DEFAULT_OCR_PSMS).split(",") if item.strip()]
     with tempfile.TemporaryDirectory(prefix="receipt-image-ocr-", dir=temp_dir_parent()) as temp_dir:
         for variant_name, image in variants:
             image_path = Path(temp_dir) / f"{variant_name}.png"
@@ -1658,7 +1665,7 @@ def dedupe_ocr_candidates(candidates: list[tuple[int, str, str]]) -> list[tuple[
             continue
         seen.add(key)
         unique.append((score, label, text))
-        if len(unique) >= int(os.environ.get("OCR_MAX_CANDIDATES", "3")):
+        if len(unique) >= int(os.environ.get("OCR_MAX_CANDIDATES", DEFAULT_OCR_MAX_CANDIDATES)):
             break
     return unique
 
@@ -2032,7 +2039,7 @@ class MiniMaxExtractor(BaseExtractor):
                 f"{self.base_url}/v1/messages",
                 payload,
                 {"Authorization": f"Bearer {self.api_key}"},
-                timeout=int(os.environ.get("LLM_TIMEOUT_SECONDS", "60")),
+                timeout=int(os.environ.get("LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS)),
             )
         except ExtractionError as exc:
             if env_flag("OCR_FALLBACK_ON_LLM_ERROR", True):
@@ -2250,7 +2257,7 @@ def upload_progress(total: int, processed: int = 0, added: int = 0, failed: int 
 
 
 def receipt_process_timeout_seconds(file_count: int) -> float:
-    per_file = float(os.environ.get("RECEIPT_PROCESS_TIMEOUT_SECONDS", "90"))
+    per_file = float(os.environ.get("RECEIPT_PROCESS_TIMEOUT_SECONDS", DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS))
     return max(15.0, per_file * max(1, file_count))
 
 
@@ -3484,6 +3491,15 @@ def serve() -> None:
     httpd = ThreadingHTTPServer((host, port), ReceiptHandler)
     print(f"Receipt Reimbursement running on http://{host}:{port}")
     print(f"LLM_PROVIDER={os.environ.get('LLM_PROVIDER', 'mock')}")
+    print(
+        "Runtime timeouts: "
+        f"OCR_TIMEOUT_SECONDS={os.environ.get('OCR_TIMEOUT_SECONDS', DEFAULT_OCR_TIMEOUT_SECONDS)} "
+        f"OCR_PSMS={os.environ.get('OCR_PSMS', DEFAULT_OCR_PSMS)} "
+        f"OCR_MAX_CANDIDATES={os.environ.get('OCR_MAX_CANDIDATES', DEFAULT_OCR_MAX_CANDIDATES)} "
+        f"LLM_TIMEOUT_SECONDS={os.environ.get('LLM_TIMEOUT_SECONDS', DEFAULT_LLM_TIMEOUT_SECONDS)} "
+        "RECEIPT_PROCESS_TIMEOUT_SECONDS="
+        f"{os.environ.get('RECEIPT_PROCESS_TIMEOUT_SECONDS', DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS)}"
+    )
     httpd.serve_forever()
 
 
