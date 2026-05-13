@@ -1595,9 +1595,13 @@ def resize_for_ocr(image, target_min: int | None = None):
 
 def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
     candidates: list[tuple[int, str, str]] = []
-    raw_text, raw_error, raw_code = run_tesseract(path)
-    if raw_text:
-        candidates.append((max(0, ocr_score(raw_text) - 80), "raw", raw_text))
+    raw_text = ""
+    raw_code = 0
+    raw_error = ""
+    if env_flag("OCR_RAW_ORIGINAL", False):
+        raw_text, raw_error, raw_code = run_tesseract(path)
+        if raw_text:
+            candidates.append((max(0, ocr_score(raw_text) - 80), "raw", raw_text))
 
     try:
         from PIL import Image, ImageOps  # type: ignore
@@ -1614,17 +1618,23 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
         return candidates
 
     base = resize_for_ocr(base)
-    variants = [("rgb", base)]
+    enabled_variants = {
+        item.strip().lower()
+        for item in os.environ.get("OCR_VARIANTS", "gray,rgb").split(",")
+        if item.strip()
+    }
+    variants = []
     gray = ImageOps.autocontrast(ImageOps.grayscale(base))
-    variants.append(("gray", gray))
+    if "gray" in enabled_variants:
+        variants.append(("gray", gray))
+    if "rgb" in enabled_variants:
+        variants.append(("rgb", base))
 
     if base.width > base.height * 1.15:
-        variants.extend(
-            [
-                ("rgb-rot90", base.rotate(90, expand=True)),
-                ("rgb-rot270", base.rotate(270, expand=True)),
-            ]
-        )
+        if "rot90" in enabled_variants or "rotations" in enabled_variants:
+            variants.append(("rgb-rot90", base.rotate(90, expand=True)))
+        if "rot270" in enabled_variants or "rotations" in enabled_variants:
+            variants.append(("rgb-rot270", base.rotate(270, expand=True)))
 
     psms = [item.strip() for item in os.environ.get("OCR_PSMS", "6,11").split(",") if item.strip()]
     with tempfile.TemporaryDirectory(prefix="receipt-image-ocr-", dir=temp_dir_parent()) as temp_dir:
@@ -2682,9 +2692,22 @@ def page_html() -> bytes:
     }}
 
     async function pollUploadJob(jobId) {{
+      let pollFailures = 0;
       while (true) {{
-        const res = await fetch(`/api/upload/jobs/${{encodeURIComponent(jobId)}}`, {{ headers: headers() }});
-        const data = await readJsonResponse(res);
+        let data;
+        try {{
+          const res = await fetch(`/api/upload/jobs/${{encodeURIComponent(jobId)}}`, {{ headers: headers() }});
+          data = await readJsonResponse(res);
+          pollFailures = 0;
+        }} catch (error) {{
+          pollFailures += 1;
+          if (pollFailures >= 5) {{
+            throw new Error(`Could not check upload progress: ${{error.message || String(error)}}`);
+          }}
+          setMessage(`Still processing. Reconnecting to upload status... (${{pollFailures}}/5)`);
+          await sleep(2500);
+          continue;
+        }}
         const progress = data.progress || {{}};
         const total = progress.total || totalSelectedCount();
         const processed = progress.processed || 0;

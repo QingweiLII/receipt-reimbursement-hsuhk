@@ -23,6 +23,16 @@ services:
         value: https://api.frankfurter.dev/v2
       - key: FX_LOOKBACK_DAYS
         value: 7
+      - key: OCR_TARGET_MIN_EDGE
+        value: 900
+      - key: OCR_MAX_LONG_EDGE
+        value: 2000
+      - key: OCR_PSMS
+        value: 6
+      - key: OCR_TIMEOUT_SECONDS
+        value: 20
+      - key: OCR_MAX_CANDIDATES
+        value: 2
       - key: STORAGE_PROVIDER
         value: user_google_drive
       - key: GOOGLE_DRIVE_FOLDER_NAME
