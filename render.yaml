@@ -17,6 +17,12 @@ services:
         value: MiniMax-M2.7
       - key: LLM_MAX_TOKENS
         value: 2500
+      - key: LLM_TIMEOUT_SECONDS
+        value: 45
+      - key: OCR_FALLBACK_ON_LLM_ERROR
+        value: true
+      - key: RECEIPT_PROCESS_TIMEOUT_SECONDS
+        value: 80
       - key: EXCHANGE_RATE_PROVIDER
         value: frankfurter
       - key: FX_BASE_URL

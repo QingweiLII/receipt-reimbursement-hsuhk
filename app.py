@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import traceback
@@ -15,7 +16,7 @@ import tempfile
 import time
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1710,8 +1711,139 @@ def post_json(url: str, payload: dict, headers: dict[str, str], timeout: int = 1
         raise ExtractionError(f"API returned HTTP {exc.code}: {details}") from exc
     except error.URLError as exc:
         raise ExtractionError(f"API request failed: {exc}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise ExtractionError(f"API request timed out after {timeout} seconds.") from exc
     except json.JSONDecodeError as exc:
         raise ExtractionError("API returned non-JSON response.") from exc
+
+
+def parse_any_date(value: str) -> dt.date | None:
+    for match in re.finditer(r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", value):
+        parsed = parse_iso_date(match.group(0))
+        if parsed:
+            return parsed
+    return None
+
+
+def all_text_dates(text: str) -> list[dt.date]:
+    dates: list[dt.date] = []
+    for match in re.finditer(r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", text):
+        parsed = parse_iso_date(match.group(0))
+        if parsed:
+            dates.append(parsed)
+    return dates
+
+
+def amount_candidates_with_context(text: str) -> list[tuple[float, str, str]]:
+    candidates: list[tuple[float, str, str]] = []
+    global_currency = infer_currency_from_context(text)
+    for line in text.splitlines():
+        currency = normalize_currency(parse_amount_and_currency(line, "")[1])
+        if not currency:
+            for code in ["HKD", "DKK", "USD", "CNY", "SGD", "EUR", "GBP", "JPY"]:
+                if re.search(rf"\b{re.escape(code)}\b", line, flags=re.IGNORECASE):
+                    currency = code
+                    break
+        if not currency and "$" in line:
+            currency = global_currency or "HKD"
+        for match in re.finditer(r"[-+]?\d[\d,]*(?:\.\d+)?", line):
+            amount, _ = parse_amount_and_currency(match.group(0), currency)
+            if amount is not None and 0 < amount < 100000:
+                candidates.append((amount, currency, line.strip()))
+    return candidates
+
+
+def preferred_amount_from_text(text: str) -> tuple[float | None, str, str]:
+    candidates = amount_candidates_with_context(text)
+    if not candidates:
+        return None, "", ""
+    priority_terms = [
+        "total incl",
+        "total",
+        "mastercard",
+        "visa",
+        "paid",
+        "kpay",
+        "fare",
+    ]
+    priority = [
+        item
+        for item in candidates
+        if any(term in item[2].lower() for term in priority_terms)
+        and "balance" not in item[2].lower()
+    ]
+    currency_candidates = [item for item in candidates if item[1]]
+    selected = max(priority or currency_candidates or candidates, key=lambda item: item[0])
+    if not selected[1]:
+        for candidate in currency_candidates:
+            if abs(candidate[0] - selected[0]) < 0.005:
+                selected = candidate
+                break
+    return selected
+
+
+def first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip(" <>|")
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def heuristic_records_from_ocr(extracted_text: str, original_name: str, reason: str = "") -> list[dict]:
+    text = extracted_text or ""
+    lower = text.lower()
+    dates = all_text_dates(text)
+    receipt_date = max(dates).isoformat() if dates else ""
+    time_match = re.search(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", text)
+    time_value = time_match.group(0)[:5] if time_match else ""
+    amount, currency, amount_line = preferred_amount_from_text(text)
+    if not currency:
+        currency = infer_currency_from_context(f"{original_name} {text[:3000]}")
+    amount_local = amount_with_currency(amount, currency) if amount is not None else ""
+    person_match = re.search(r"Guest Name\s*[:;|]?\s*([A-Za-z][A-Za-z .'-]{1,60})", text, flags=re.IGNORECASE)
+    person = person_match.group(1).strip() if person_match else ""
+
+    merchant = first_nonempty_line(text)
+    if "crowne plaza" in lower:
+        activities = "Accommodation at Crowne Plaza Copenhagen Towers"
+        location = "Copenhagen, Denmark"
+        address = "Orestads Boulevard 114-118, DK-2300 Copenhagen S"
+        raw_type = "Accommondation"
+    elif "hoopla" in lower:
+        activities = "Meal at Hoopla Restaurant"
+        location = "Hong Kong"
+        address = ""
+        raw_type = "Meal"
+    else:
+        activities = merchant or Path(original_name).stem
+        location = ""
+        address = ""
+        raw_type = ""
+
+    notes = "Fallback extraction from OCR text."
+    if amount_line:
+        notes += f" Amount source: {amount_line}."
+    if reason:
+        notes += f" LLM unavailable: {reason}"
+
+    return [
+        {
+            "date": receipt_date,
+            "time": time_value,
+            "person": person,
+            "type": classify_expense(raw_type, activities, original_name),
+            "activities": activities,
+            "location": location,
+            "address": address,
+            "amount_in_local_currency": amount_local,
+            "amount_in_hkd": "",
+            "confidence": "ocr_fallback",
+            "notes": notes,
+            "currency": currency,
+            "_ocr_text": text[:12000],
+        }
+    ]
 
 
 class BaseExtractor:
@@ -1895,11 +2027,17 @@ class MiniMaxExtractor(BaseExtractor):
                 {"role": "user", "content": [{"type": "text", "text": f"{prompt}\n\n{text_source}:\n{extracted_text[:50000]}"}]},
             ],
         }
-        data = post_json(
-            f"{self.base_url}/v1/messages",
-            payload,
-            {"Authorization": f"Bearer {self.api_key}"},
-        )
+        try:
+            data = post_json(
+                f"{self.base_url}/v1/messages",
+                payload,
+                {"Authorization": f"Bearer {self.api_key}"},
+                timeout=int(os.environ.get("LLM_TIMEOUT_SECONDS", "60")),
+            )
+        except ExtractionError as exc:
+            if env_flag("OCR_FALLBACK_ON_LLM_ERROR", True):
+                return heuristic_records_from_ocr(extracted_text, original_name, str(exc))
+            raise
         text = "\n".join(
             part.get("text", "")
             for part in data.get("content", [])
@@ -2111,6 +2249,11 @@ def upload_progress(total: int, processed: int = 0, added: int = 0, failed: int 
     }
 
 
+def receipt_process_timeout_seconds(file_count: int) -> float:
+    per_file = float(os.environ.get("RECEIPT_PROCESS_TIMEOUT_SECONDS", "90"))
+    return max(15.0, per_file * max(1, file_count))
+
+
 def process_upload_batch(
     local_files: list[dict],
     drive_file_ids: list[str],
@@ -2159,14 +2302,40 @@ def process_upload_batch(
         if job_id:
             update_upload_job(job_id, phase="Extracting receipt data")
         max_workers = max(1, int(os.environ.get("MAX_PARALLEL_RECEIPTS", "3")))
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(files))) as executor:
-            futures = {executor.submit(process_upload_item, item, client_id): safe_filename(item["filename"]) for item in files}
-            for future in as_completed(futures):
+        executor = ThreadPoolExecutor(max_workers=min(max_workers, len(files)))
+        futures = {executor.submit(process_upload_item, item, client_id): safe_filename(item["filename"]) for item in files}
+        pending = set(futures)
+        deadline = time.monotonic() + receipt_process_timeout_seconds(len(files))
+        try:
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, pending = wait(pending, timeout=min(5.0, remaining), return_when=FIRST_COMPLETED)
+                if not done and job_id:
+                    update_upload_job(job_id, phase="Extracting receipt data")
+                for future in done:
+                    filename = futures[future]
+                    try:
+                        normalized.extend(future.result())
+                    except Exception as exc:
+                        errors.append({"file": filename, "error": str(exc)})
+                    processed_count += 1
+                    if job_id:
+                        update_upload_job(
+                            job_id,
+                            progress=upload_progress(total_requested, processed_count, len(normalized), len(errors)),
+                            errors=list(errors),
+                        )
+            for future in pending:
                 filename = futures[future]
-                try:
-                    normalized.extend(future.result())
-                except Exception as exc:
-                    errors.append({"file": filename, "error": str(exc)})
+                future.cancel()
+                errors.append(
+                    {
+                        "file": filename,
+                        "error": f"Receipt processing timed out after {int(receipt_process_timeout_seconds(len(files)))} seconds.",
+                    }
+                )
                 processed_count += 1
                 if job_id:
                     update_upload_job(
@@ -2174,6 +2343,8 @@ def process_upload_batch(
                         progress=upload_progress(total_requested, processed_count, len(normalized), len(errors)),
                         errors=list(errors),
                     )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     workbook_url = ""
     if normalized:
