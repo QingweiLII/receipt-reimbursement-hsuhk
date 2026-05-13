@@ -30,7 +30,11 @@ services:
       - key: MAX_UPLOAD_MB
         value: 20
       - key: MAX_PARALLEL_RECEIPTS
-        value: 10
+        value: 2
+      - key: UPLOAD_JOB_WORKERS
+        value: 1
+      - key: MAX_ACTIVE_UPLOAD_JOBS
+        value: 4
       - key: MAX_FILES_PER_UPLOAD
         value: 10
       - key: LLM_API_KEY

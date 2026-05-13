@@ -5,6 +5,7 @@ A small receipt upload app for reimbursement tracking.
 It accepts images and PDFs, sends them to a configurable LLM API, extracts reimbursement fields, and generates a reimbursement workbook.
 
 Each browser gets its own local `client_id`. Uploads and downloads are stored under `data/clients/<client_id>/`, so different colleagues using the same link get separate Excel files. The upload form accepts multiple files and processes them in parallel.
+Uploads run as background jobs. The browser gets a job id immediately and polls for completion, so slow OCR/LLM/Drive work does not hold one long HTTP request open.
 
 ## Run locally
 
@@ -146,6 +147,7 @@ GOOGLE_OAUTH_CLIENT_SECRET=your-oauth-client-secret
 ```
 
 `render.yaml` already sets the non-secret defaults for MiniMax, per-user Google Drive storage, OCR, and the app route.
+On small Render instances, keep `MAX_PARALLEL_RECEIPTS` low. The included Render config uses `UPLOAD_JOB_WORKERS=1` and `MAX_PARALLEL_RECEIPTS=2` so one upload can continue in the background without exhausting the instance.
 
 `PUBLIC_BASE_URL` is optional. Set it only if your host does not report the public HTTPS URL correctly, or after you attach a custom domain.
 

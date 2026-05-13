@@ -12,6 +12,7 @@ import subprocess
 import sys
 import traceback
 import tempfile
+import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -75,6 +76,11 @@ FIELD_ALIASES = {
 STORE_LOCK = Lock()
 GOOGLE_OAUTH_LOCK = Lock()
 GOOGLE_OAUTH_STATES: dict[str, dict[str, str]] = {}
+UPLOAD_JOBS_LOCK = Lock()
+UPLOAD_JOB_EXECUTOR_LOCK = Lock()
+UPLOAD_JOBS: dict[str, dict] = {}
+UPLOAD_JOB_EXECUTOR: ThreadPoolExecutor | None = None
+TERMINAL_UPLOAD_STATUSES = {"completed", "failed"}
 FX_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 EXPENSE_TYPES = ["Flight", "Meal", "Accommondation", "Transportation", "Others"]
 GOOGLE_CLIENT_HEADER = "Client ID"
@@ -2013,6 +2019,236 @@ def process_upload_item(item: dict, client_id: str) -> list[dict]:
     return [normalize_record(merged_record, original, str(stored_path))]
 
 
+def upload_job_workers() -> int:
+    return max(1, int(os.environ.get("UPLOAD_JOB_WORKERS", "2")))
+
+
+def upload_job_ttl_seconds() -> int:
+    return max(60, int(os.environ.get("UPLOAD_JOB_TTL_SECONDS", "86400")))
+
+
+def max_active_upload_jobs() -> int:
+    return max(1, int(os.environ.get("MAX_ACTIVE_UPLOAD_JOBS", "8")))
+
+
+def get_upload_job_executor() -> ThreadPoolExecutor:
+    global UPLOAD_JOB_EXECUTOR
+    with UPLOAD_JOB_EXECUTOR_LOCK:
+        if UPLOAD_JOB_EXECUTOR is None:
+            UPLOAD_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=upload_job_workers())
+        return UPLOAD_JOB_EXECUTOR
+
+
+def cleanup_upload_jobs_unlocked() -> None:
+    cutoff = time.time() - upload_job_ttl_seconds()
+    for job_id, job in list(UPLOAD_JOBS.items()):
+        if job.get("status") in TERMINAL_UPLOAD_STATUSES and float(job.get("updated_ts", 0)) < cutoff:
+            del UPLOAD_JOBS[job_id]
+
+
+def upload_job_snapshot(job: dict) -> dict:
+    keys = [
+        "id",
+        "client_id",
+        "status",
+        "created_at",
+        "updated_at",
+        "phase",
+        "progress",
+        "result",
+        "error",
+        "errors",
+    ]
+    return {key: job.get(key) for key in keys if key in job}
+
+
+def update_upload_job(job_id: str, **updates) -> None:
+    with UPLOAD_JOBS_LOCK:
+        job = UPLOAD_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = now_local()
+        job["updated_ts"] = time.time()
+
+
+def upload_progress(total: int, processed: int = 0, added: int = 0, failed: int = 0) -> dict:
+    return {
+        "total": total,
+        "processed": min(processed, total),
+        "added": added,
+        "failed": failed,
+    }
+
+
+def process_upload_batch(
+    local_files: list[dict],
+    drive_file_ids: list[str],
+    fields: dict[str, str],
+    client_id: str,
+    drive_session: dict | None,
+    job_id: str | None = None,
+) -> dict:
+    total_requested = len(local_files) + len(drive_file_ids)
+    files = list(local_files)
+    errors: list[dict] = []
+    processed_count = 0
+
+    if job_id:
+        update_upload_job(
+            job_id,
+            phase="Preparing files",
+            progress=upload_progress(total_requested),
+            errors=[],
+        )
+
+    if drive_file_ids:
+        if not drive_session:
+            raise ExtractionError("Please connect Google Drive before choosing Drive files.")
+        for file_id in drive_file_ids:
+            if job_id:
+                update_upload_job(job_id, phase="Downloading selected Google Drive files")
+            try:
+                files.append(drive_upload_item(drive_session, file_id))
+            except Exception as exc:
+                errors.append({"file": file_id, "error": str(exc)})
+                processed_count += 1
+                if job_id:
+                    update_upload_job(
+                        job_id,
+                        progress=upload_progress(total_requested, processed_count, 0, len(errors)),
+                        errors=list(errors),
+                    )
+
+    save_mode = fields.get("save_mode", "batch").strip().lower()
+    append_to_store = save_mode in {"append", "recent7"}
+    batch_id = uuid.uuid4().hex
+    normalized: list[dict] = []
+
+    if files:
+        if job_id:
+            update_upload_job(job_id, phase="Extracting receipt data")
+        max_workers = max(1, int(os.environ.get("MAX_PARALLEL_RECEIPTS", "3")))
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(files))) as executor:
+            futures = {executor.submit(process_upload_item, item, client_id): safe_filename(item["filename"]) for item in files}
+            for future in as_completed(futures):
+                filename = futures[future]
+                try:
+                    normalized.extend(future.result())
+                except Exception as exc:
+                    errors.append({"file": filename, "error": str(exc)})
+                processed_count += 1
+                if job_id:
+                    update_upload_job(
+                        job_id,
+                        progress=upload_progress(total_requested, processed_count, len(normalized), len(errors)),
+                        errors=list(errors),
+                    )
+
+    workbook_url = ""
+    if normalized:
+        if job_id:
+            update_upload_job(job_id, phase="Saving workbook")
+        if drive_session:
+            drive_file = save_records_to_user_drive(drive_session, normalized, save_mode, client_id)
+            workbook_url = str(drive_file.get("webViewLink") or drive_file.get("webContentLink") or "")
+        elif append_to_store:
+            all_records = append_records(normalized, client_id)
+            if save_mode == "recent7":
+                workbook_path = CLIENTS_DIR / safe_client_id(client_id) / "recent7" / "reimbursements.xlsx"
+                write_workbook(filter_recent_records(all_records, 7), workbook_path)
+                workbook_url = f"/download.xlsx?client_id={parse.quote(client_id)}&range=recent7"
+            else:
+                workbook_url = f"/download.xlsx?client_id={parse.quote(client_id)}"
+        else:
+            workbook_path = batch_workbook_path(client_id, batch_id)
+            write_workbook(normalized, workbook_path)
+            workbook_url = f"/download.xlsx?client_id={parse.quote(client_id)}&batch_id={parse.quote(batch_id)}"
+
+    if errors and not normalized:
+        return {
+            "ok": False,
+            "error": errors[0]["error"],
+            "errors": errors,
+            "added": 0,
+            "batch_id": "",
+            "workbook": "",
+            "save_mode": save_mode if save_mode in {"append", "recent7", "batch"} else "batch",
+            "saved_to_google_drive": False,
+            "provider": os.environ.get("LLM_PROVIDER", "mock"),
+        }
+
+    return {
+        "ok": True,
+        "added": len(normalized),
+        "errors": errors,
+        "batch_id": "" if append_to_store or drive_session else batch_id,
+        "workbook": workbook_url,
+        "save_mode": save_mode if save_mode in {"append", "recent7", "batch"} else "batch",
+        "saved_to_google_drive": bool(drive_session and workbook_url),
+        "provider": os.environ.get("LLM_PROVIDER", "mock"),
+    }
+
+
+def run_upload_job(
+    job_id: str,
+    local_files: list[dict],
+    drive_file_ids: list[str],
+    fields: dict[str, str],
+    client_id: str,
+    drive_session: dict | None,
+) -> None:
+    print(f"Upload job {job_id} started with {len(local_files) + len(drive_file_ids)} file(s).", flush=True)
+    update_upload_job(job_id, status="running", phase="Starting")
+    try:
+        result = process_upload_batch(local_files, drive_file_ids, fields, client_id, drive_session, job_id)
+        update_upload_job(
+            job_id,
+            status="completed",
+            phase="Done",
+            result=result,
+            error="" if result.get("ok") else str(result.get("error", "Upload failed.")),
+            errors=result.get("errors", []),
+        )
+        print(f"Upload job {job_id} completed: added {result.get('added', 0)} row(s).", flush=True)
+    except Exception as exc:
+        traceback.print_exc()
+        update_upload_job(job_id, status="failed", phase="Failed", error=str(exc), errors=[{"file": "", "error": str(exc)}])
+        print(f"Upload job {job_id} failed: {exc}", flush=True)
+
+
+def start_upload_job(
+    local_files: list[dict],
+    drive_file_ids: list[str],
+    fields: dict[str, str],
+    client_id: str,
+    drive_session: dict | None,
+) -> str:
+    with UPLOAD_JOBS_LOCK:
+        cleanup_upload_jobs_unlocked()
+        active_count = sum(1 for job in UPLOAD_JOBS.values() if job.get("status") not in TERMINAL_UPLOAD_STATUSES)
+        if active_count >= max_active_upload_jobs():
+            raise ExtractionError("The upload server is busy. Please try again in a moment.")
+        job_id = uuid.uuid4().hex
+        now = now_local()
+        UPLOAD_JOBS[job_id] = {
+            "id": job_id,
+            "client_id": safe_client_id(client_id),
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "created_ts": time.time(),
+            "updated_ts": time.time(),
+            "phase": "Queued",
+            "progress": upload_progress(len(local_files) + len(drive_file_ids)),
+            "result": None,
+            "error": "",
+            "errors": [],
+        }
+    get_upload_job_executor().submit(run_upload_job, job_id, local_files, drive_file_ids, fields, client_id, drive_session)
+    return job_id
+
+
 def page_html() -> bytes:
     provider_warning = ""
     if os.environ.get("LLM_PROVIDER", "mock").strip().lower() == "fixture":
@@ -2410,6 +2646,40 @@ def page_html() -> bytes:
       message.className = mode ? `message ${{mode}}` : "message";
     }}
 
+    function sleep(ms) {{
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }}
+
+    async function readJsonResponse(res) {{
+      const text = await res.text();
+      let data;
+      try {{ data = JSON.parse(text); }} catch {{
+        const compact = text.trim().startsWith("<") ? "The server returned an HTML error page. Check the Render logs for the upload job." : text;
+        throw new Error(compact);
+      }}
+      if (!res.ok) throw new Error(data.error || text);
+      return data;
+    }}
+
+    async function pollUploadJob(jobId) {{
+      while (true) {{
+        const res = await fetch(`/api/upload/jobs/${{encodeURIComponent(jobId)}}`, {{ headers: headers() }});
+        const data = await readJsonResponse(res);
+        const progress = data.progress || {{}};
+        const total = progress.total || totalSelectedCount();
+        const processed = progress.processed || 0;
+        const phase = data.phase ? ` ${{data.phase}}.` : "";
+        setMessage(`Processing ${{processed}}/${{total}} file(s)...${{phase}}`);
+        if (data.status === "completed") {{
+          const result = data.result || {{}};
+          if (!result.ok) throw new Error(result.error || "Upload failed.");
+          return result;
+        }}
+        if (data.status === "failed") throw new Error(data.error || "Upload failed.");
+        await sleep(1800);
+      }}
+    }}
+
     function formatBytes(bytes) {{
       if (!bytes) return "0 B";
       const units = ["B", "KB", "MB", "GB"];
@@ -2584,10 +2854,9 @@ def page_html() -> bytes:
         form.append("drive_file_ids", JSON.stringify(Array.from(selectedDriveFiles.keys())));
         form.append("save_mode", document.querySelector('input[name="saveMode"]:checked').value);
         const res = await fetch("/api/upload", {{ method: "POST", headers: headers(), body: form }});
-        const text = await res.text();
-        let data;
-        try {{ data = JSON.parse(text); }} catch {{ throw new Error(text); }}
-        if (!res.ok) throw new Error(data.error || text);
+        const started = await readJsonResponse(res);
+        const data = started.job_id ? await pollUploadJob(started.job_id) : started;
+        if (!data.ok) throw new Error(data.error || "Upload failed.");
         latestBatchId = data.batch_id || "";
         latestWorkbookUrl = data.workbook || "";
         updateDownloadLink();
@@ -2794,6 +3063,23 @@ class ReceiptHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_empty(self, status: int, content_type: str = "text/plain; charset=utf-8") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:
+        ensure_dirs()
+        path = parse.unquote(parse.urlparse(self.path).path)
+        if path == "/health":
+            self.send_empty(200, "application/json; charset=utf-8")
+            return
+        if path in PAGE_PATHS:
+            self.send_empty(200, "text/html; charset=utf-8")
+            return
+        self.send_empty(404)
+
     def do_GET(self) -> None:
         ensure_dirs()
         path = parse.unquote(parse.urlparse(self.path).path)
@@ -2849,6 +3135,20 @@ class ReceiptHandler(BaseHTTPRequestHandler):
             except ExtractionError as exc:
                 self.send_json(422, {"error": str(exc)})
             return
+        if path.startswith("/api/upload/jobs/"):
+            job_id = safe_client_id(path.rsplit("/", 1)[-1])
+            with UPLOAD_JOBS_LOCK:
+                cleanup_upload_jobs_unlocked()
+                job = UPLOAD_JOBS.get(job_id)
+                snapshot = upload_job_snapshot(job) if job else None
+            if not snapshot:
+                self.send_json(404, {"error": "Upload job not found."})
+                return
+            if safe_client_id(snapshot.get("client_id")) != self.client_id():
+                self.send_json(404, {"error": "Upload job not found."})
+                return
+            self.send_json(200, snapshot)
+            return
         if path == "/api/records":
             client_id = self.client_id()
             self.send_json(200, {"records": read_records(client_id), "workbook": f"/download.xlsx?client_id={parse.quote(client_id)}"})
@@ -2899,7 +3199,6 @@ class ReceiptHandler(BaseHTTPRequestHandler):
                 return
             body = self.rfile.read(length)
             files, fields = parse_multipart(self.headers, body)
-            drive_session = self.require_google_session() if user_google_drive_enabled() else None
             drive_file_ids: list[str] = []
             if fields.get("drive_file_ids", "").strip():
                 try:
@@ -2912,61 +3211,25 @@ class ReceiptHandler(BaseHTTPRequestHandler):
             if len(files) + len(drive_file_ids) > max_files:
                 self.send_json(400, {"error": f"Upload at most {max_files} files at a time."})
                 return
-            if drive_file_ids:
-                if not drive_session:
-                    raise ExtractionError("Please connect Google Drive before choosing Drive files.")
-                files.extend(drive_upload_item(drive_session, file_id) for file_id in drive_file_ids)
-            if not files:
+            if not files and not drive_file_ids:
                 self.send_json(400, {"error": "No files were uploaded."})
                 return
 
             client_id = self.client_id()
-            save_mode = fields.get("save_mode", "batch").strip().lower()
-            append_to_store = save_mode in {"append", "recent7"}
-            batch_id = uuid.uuid4().hex
-            normalized: list[dict] = []
-            errors: list[dict] = []
-            max_workers = max(1, int(os.environ.get("MAX_PARALLEL_RECEIPTS", "10")))
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(files))) as executor:
-                futures = {executor.submit(process_upload_item, item, client_id): safe_filename(item["filename"]) for item in files}
-                for future in as_completed(futures):
-                    filename = futures[future]
-                    try:
-                        normalized.extend(future.result())
-                    except Exception as exc:
-                        errors.append({"file": filename, "error": str(exc)})
-
-            workbook_url = ""
-            if normalized:
-                if drive_session:
-                    drive_file = save_records_to_user_drive(drive_session, normalized, save_mode, client_id)
-                    workbook_url = str(drive_file.get("webViewLink") or drive_file.get("webContentLink") or "")
-                elif append_to_store:
-                    all_records = append_records(normalized, client_id)
-                    if save_mode == "recent7":
-                        workbook_path = CLIENTS_DIR / safe_client_id(client_id) / "recent7" / "reimbursements.xlsx"
-                        write_workbook(filter_recent_records(all_records, 7), workbook_path)
-                        workbook_url = f"/download.xlsx?client_id={parse.quote(client_id)}&range=recent7"
-                    else:
-                        workbook_url = f"/download.xlsx?client_id={parse.quote(client_id)}"
-                else:
-                    workbook_path = batch_workbook_path(client_id, batch_id)
-                    write_workbook(normalized, workbook_path)
-                    workbook_url = f"/download.xlsx?client_id={parse.quote(client_id)}&batch_id={parse.quote(batch_id)}"
-            if errors and not normalized:
-                self.send_json(422, {"error": errors[0]["error"], "errors": errors})
-                return
-
+            drive_session = None
+            if user_google_drive_enabled():
+                drive_session = self.require_google_session()
+            elif drive_file_ids:
+                raise ExtractionError("Google Drive file selection is not enabled on this server.")
+            job_id = start_upload_job(files, drive_file_ids, fields, client_id, drive_session)
             self.send_json(
-                200,
+                202,
                 {
                     "ok": True,
-                    "added": len(normalized),
-                    "errors": errors,
-                    "batch_id": "" if append_to_store or drive_session else batch_id,
-                    "workbook": workbook_url,
-                    "save_mode": save_mode if save_mode in {"append", "recent7", "batch"} else "batch",
-                    "saved_to_google_drive": bool(drive_session and workbook_url),
+                    "job_id": job_id,
+                    "status": "queued",
+                    "status_url": f"/api/upload/jobs/{parse.quote(job_id)}",
+                    "total": len(files) + len(drive_file_ids),
                     "provider": os.environ.get("LLM_PROVIDER", "mock"),
                 },
             )
