@@ -43,6 +43,10 @@ DEFAULT_OCR_ORIENTATION_MAX_LONG_EDGE = "1200"
 DEFAULT_OCR_ORIENTATION_PSMS = "6"
 DEFAULT_LLM_TIMEOUT_SECONDS = "45"
 DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS = "120"
+DEFAULT_UPLOAD_JOB_WORKERS = "1"
+DEFAULT_MAX_ACTIVE_UPLOAD_JOBS = "4"
+DEFAULT_MAX_PARALLEL_RECEIPTS = "1"
+DEFAULT_MAX_FILES_PER_UPLOAD = "10"
 
 HEADERS = [
     "Date",
@@ -875,19 +879,30 @@ def infer_currency_from_context(context: str) -> str:
     return ""
 
 
+def normalize_receipt_date(parsed: dt.date) -> dt.date | None:
+    max_year = dt.date.today().year + 2
+    if parsed.year <= max_year:
+        return parsed
+    if 2800 <= parsed.year <= 2899:
+        corrected = parsed.replace(year=parsed.year - 800)
+        if corrected.year <= max_year:
+            return corrected
+    return None
+
+
 def parse_iso_date(value: str) -> dt.date | None:
     text = str(value or "").strip()
     if not text:
         return None
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
         try:
-            return dt.datetime.strptime(text, fmt).date()
+            return normalize_receipt_date(dt.datetime.strptime(text, fmt).date())
         except ValueError:
             pass
     match = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", text)
     if match:
         try:
-            return dt.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            return normalize_receipt_date(dt.date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
         except ValueError:
             return None
     return None
@@ -968,7 +983,7 @@ def classify_expense(raw_type: str, activities: str, source_file: str) -> str:
     for allowed in EXPENSE_TYPES:
         if value.lower() == allowed.lower() and allowed != "Others":
             return allowed
-    text = f"{value} {activities} {source_file}".lower()
+    text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", f"{value} {activities} {source_file}".lower())
     if re.search(r"\b(flight|airline|airport|air ticket|e-ticket|boarding|thai airways|trip\.com)\b", text):
         return "Flight"
     if re.search(r"\b(meal|restaurant|cafe|coffee|lunch|dinner|breakfast|food|bakery|dessert|refreshment|croissant|baguette|chocolate|tokachi|gcap|茶餐廳|餐|飯|奶茶)\b", text):
@@ -1948,7 +1963,7 @@ def preferred_amount_from_text(text: str) -> tuple[float | None, str, str]:
 def first_nonempty_line(text: str) -> str:
     for line in text.splitlines():
         cleaned = re.sub(r"\s+", " ", line).strip(" <>|")
-        if cleaned:
+        if cleaned and not cleaned.lower().startswith("ocr candidate"):
             return cleaned
     return ""
 
@@ -1968,6 +1983,7 @@ def heuristic_records_from_ocr(extracted_text: str, original_name: str, reason: 
     person = person_match.group(1).strip() if person_match else ""
 
     merchant = first_nonempty_line(text)
+    context_for_type = re.sub(r"[^a-z0-9]+", " ", f"{original_name} {lower}".lower())
     if "crowne plaza" in lower:
         activities = "Accommodation at Crowne Plaza Copenhagen Towers"
         location = "Copenhagen, Denmark"
@@ -1978,6 +1994,11 @@ def heuristic_records_from_ocr(extracted_text: str, original_name: str, reason: 
         location = "Hong Kong"
         address = ""
         raw_type = "Meal"
+    elif re.search(r"\b(taxi|total fare|paid km|surcharge)\b", context_for_type):
+        activities = "Taxi"
+        location = "Hong Kong" if currency == "HKD" else ""
+        address = ""
+        raw_type = "Transportation"
     else:
         activities = merchant or Path(original_name).stem
         location = ""
@@ -2358,7 +2379,7 @@ def process_upload_item(item: dict, client_id: str) -> list[dict]:
 
 
 def upload_job_workers() -> int:
-    return max(1, int(os.environ.get("UPLOAD_JOB_WORKERS", "2")))
+    return max(1, int(os.environ.get("UPLOAD_JOB_WORKERS", DEFAULT_UPLOAD_JOB_WORKERS)))
 
 
 def upload_job_ttl_seconds() -> int:
@@ -2366,7 +2387,7 @@ def upload_job_ttl_seconds() -> int:
 
 
 def max_active_upload_jobs() -> int:
-    return max(1, int(os.environ.get("MAX_ACTIVE_UPLOAD_JOBS", "8")))
+    return max(1, int(os.environ.get("MAX_ACTIVE_UPLOAD_JOBS", DEFAULT_MAX_ACTIVE_UPLOAD_JOBS)))
 
 
 def get_upload_job_executor() -> ThreadPoolExecutor:
@@ -2472,7 +2493,7 @@ def process_upload_batch(
     if files:
         if job_id:
             update_upload_job(job_id, phase="Extracting receipt data")
-        max_workers = max(1, int(os.environ.get("MAX_PARALLEL_RECEIPTS", "3")))
+        max_workers = max(1, int(os.environ.get("MAX_PARALLEL_RECEIPTS", DEFAULT_MAX_PARALLEL_RECEIPTS)))
         executor = ThreadPoolExecutor(max_workers=min(max_workers, len(files)))
         futures = {executor.submit(process_upload_item, item, client_id): safe_filename(item["filename"]) for item in files}
         pending = set(futures)
@@ -3646,7 +3667,7 @@ class ReceiptHandler(BaseHTTPRequestHandler):
                         drive_file_ids = [str(item) for item in parsed_ids if str(item).strip()]
                 except json.JSONDecodeError as exc:
                     raise ExtractionError("drive_file_ids must be a JSON array.") from exc
-            max_files = max(1, int(os.environ.get("MAX_FILES_PER_UPLOAD", os.environ.get("MAX_PARALLEL_RECEIPTS", "10"))))
+            max_files = max(1, int(os.environ.get("MAX_FILES_PER_UPLOAD", DEFAULT_MAX_FILES_PER_UPLOAD)))
             if len(files) + len(drive_file_ids) > max_files:
                 self.send_json(400, {"error": f"Upload at most {max_files} files at a time."})
                 return
@@ -3718,6 +3739,8 @@ def serve() -> None:
         f"OCR_PSMS={os.environ.get('OCR_PSMS', DEFAULT_OCR_PSMS)} "
         f"OCR_MAX_CANDIDATES={os.environ.get('OCR_MAX_CANDIDATES', DEFAULT_OCR_MAX_CANDIDATES)} "
         f"LLM_TIMEOUT_SECONDS={os.environ.get('LLM_TIMEOUT_SECONDS', DEFAULT_LLM_TIMEOUT_SECONDS)} "
+        f"MAX_PARALLEL_RECEIPTS={os.environ.get('MAX_PARALLEL_RECEIPTS', DEFAULT_MAX_PARALLEL_RECEIPTS)} "
+        f"UPLOAD_JOB_WORKERS={os.environ.get('UPLOAD_JOB_WORKERS', DEFAULT_UPLOAD_JOB_WORKERS)} "
         "RECEIPT_PROCESS_TIMEOUT_SECONDS="
         f"{os.environ.get('RECEIPT_PROCESS_TIMEOUT_SECONDS', DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS)}"
     )
