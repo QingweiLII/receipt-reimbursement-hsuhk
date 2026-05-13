@@ -1114,6 +1114,15 @@ def normalize_record(raw: dict, source_file: str, stored_file: str) -> dict:
     elif amount_local and currency and currency not in amount_local.upper():
         amount_local = f"{amount_local} {currency}".strip()
 
+    ocr_amount, ocr_currency, ocr_amount_line = preferred_amount_from_text(ocr_context)
+    if not amount_local and ocr_amount is not None:
+        currency = currency or normalize_currency(ocr_currency) or infer_currency_from_context(
+            f"{context_for_currency} {ocr_context[:5000]}"
+        )
+        amount_local = amount_with_currency(ocr_amount, currency)
+        if ocr_amount_line:
+            notes = f"{notes} Amount filled from OCR fallback: {ocr_amount_line}.".strip()
+
     preferred_total = preferred_total_from_ocr(ocr_context)
     if preferred_total is not None and currency == "HKD":
         current_amount, _ = parse_amount_and_currency(amount_local, currency)
