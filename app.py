@@ -36,8 +36,8 @@ DEFAULT_OCR_TIMEOUT_SECONDS = "20"
 DEFAULT_OCR_TARGET_MIN_EDGE = "500"
 DEFAULT_OCR_MAX_LONG_EDGE = "900"
 DEFAULT_OCR_SMALL_MAX_LONG_EDGE = "650"
-DEFAULT_OCR_PSMS = "6"
-DEFAULT_OCR_MAX_CANDIDATES = "2"
+DEFAULT_OCR_PSMS = "6,11"
+DEFAULT_OCR_MAX_CANDIDATES = "3"
 DEFAULT_OCR_VARIANTS = "gray"
 DEFAULT_LLM_TIMEOUT_SECONDS = "45"
 DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS = "120"
@@ -997,10 +997,10 @@ def amount_with_currency(amount: float, currency: str) -> str:
 
 def numeric_amounts(text: str) -> list[float]:
     amounts: list[float] = []
-    for match in re.finditer(r"[-+]?\d{1,6}(?:[,.]\d{1,2})?", text):
+    for match in re.finditer(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", text):
         before = text[match.start() - 1] if match.start() > 0 else ""
         after = text[match.end()] if match.end() < len(text) else ""
-        if before in "-/:" or after in "-/:":
+        if (before and before in "-/:") or (after and after in "-/:"):
             continue
         amount, _ = parse_amount_and_currency(match.group(0), "")
         if amount is not None and 0 < amount < 100000:
@@ -1815,6 +1815,8 @@ def amount_candidates_with_context(text: str) -> list[tuple[float, str, str]]:
     candidates: list[tuple[float, str, str]] = []
     global_currency = infer_currency_from_context(text)
     for line in text.splitlines():
+        if line.strip().lower().startswith("ocr candidate"):
+            continue
         currency = normalize_currency(parse_amount_and_currency(line, "")[1])
         if not currency:
             for code in ["HKD", "DKK", "USD", "CNY", "SGD", "EUR", "GBP", "JPY"]:
@@ -1823,14 +1825,53 @@ def amount_candidates_with_context(text: str) -> list[tuple[float, str, str]]:
                     break
         if not currency and "$" in line:
             currency = global_currency or "HKD"
-        for match in re.finditer(r"[-+]?\d[\d,]*(?:\.\d+)?", line):
-            amount, _ = parse_amount_and_currency(match.group(0), currency)
-            if amount is not None and 0 < amount < 100000:
-                candidates.append((amount, currency, line.strip()))
+        for amount in numeric_amounts(line):
+            candidates.append((amount, currency, line.strip()))
     return candidates
 
 
+def nearby_priority_amount(text: str) -> tuple[float | None, str, str]:
+    lines = [line.strip() for line in text.splitlines()]
+    global_currency = infer_currency_from_context(text)
+    priority_terms = ["total incl", "total", "mastercard", "visa", "paid", "kpay", "pay", "fare"]
+    candidates: list[tuple[float, str, str]] = []
+    for index, line in enumerate(lines):
+        lower = line.lower()
+        if not any(term in lower for term in priority_terms) or "balance" in lower:
+            continue
+        same_line_amounts = numeric_amounts(line)
+        if same_line_amounts:
+            window = line
+            amounts = same_line_amounts
+        else:
+            if "total" in lower:
+                start = index
+                end = min(len(lines), index + 3)
+            elif any(term in lower for term in ["kpay", "pay", "visa", "mastercard", "paid", "fare"]):
+                start = max(0, index - 3)
+                end = min(len(lines), index + 2)
+            else:
+                start = max(0, index - 1)
+                end = min(len(lines), index + 2)
+            window = " ".join(
+                piece for piece in lines[start:end] if piece and not piece.lower().startswith("ocr candidate")
+            )
+            amounts = numeric_amounts(window)
+        currency = normalize_currency(parse_amount_and_currency(window, "")[1]) or global_currency
+        if not currency and "$" in window:
+            currency = "HKD"
+        for amount in amounts:
+            candidates.append((amount, currency, window))
+    if not candidates:
+        return None, "", ""
+    selected = max(candidates, key=lambda item: item[0])
+    return selected
+
+
 def preferred_amount_from_text(text: str) -> tuple[float | None, str, str]:
+    nearby_amount, nearby_currency, nearby_line = nearby_priority_amount(text)
+    if nearby_amount is not None:
+        return nearby_amount, nearby_currency, nearby_line
     candidates = amount_candidates_with_context(text)
     if not candidates:
         return None, "", ""
@@ -2121,7 +2162,14 @@ class MiniMaxExtractor(BaseExtractor):
             if isinstance(part, dict) and part.get("type") == "text"
         )
         text = strip_model_thinking(text)
-        records = as_records(extract_json(text))
+        try:
+            records = as_records(extract_json(text))
+        except ExtractionError as exc:
+            if env_flag("OCR_FALLBACK_ON_LLM_ERROR", True):
+                return heuristic_records_from_ocr(extracted_text, original_name, f"LLM response could not be parsed: {exc}")
+            raise
+        if not records and env_flag("OCR_FALLBACK_ON_LLM_ERROR", True):
+            return heuristic_records_from_ocr(extracted_text, original_name, "LLM returned no structured records.")
         for record in records:
             record["_ocr_text"] = extracted_text[:12000]
         return records
@@ -2397,6 +2445,7 @@ def process_upload_batch(
                     try:
                         normalized.extend(future.result())
                     except Exception as exc:
+                        print(f"Upload item {filename} failed: {exc}", flush=True)
                         errors.append({"file": filename, "error": str(exc)})
                     processed_count += 1
                     if job_id:
@@ -3188,9 +3237,13 @@ def page_html() -> bytes:
         latestBatchId = data.batch_id || "";
         latestWorkbookUrl = data.workbook || "";
         updateDownloadLink();
-        const failed = data.errors && data.errors.length ? ` ${{data.errors.length}} file(s) failed.` : "";
+        const uploadErrors = data.errors || [];
+        const failed = uploadErrors.length ? ` ${{uploadErrors.length}} file(s) failed.` : "";
+        const errorDetails = uploadErrors.length
+          ? ` Details: ${{uploadErrors.slice(0, 3).map(item => `${{item.file || "file"}}: ${{item.error || "failed"}}`).join(" | ")}}`
+          : "";
         const downloadText = data.saved_to_google_drive ? " Excel was saved to your Google Drive." : (latestBatchId ? " Download Excel now contains this upload only." : " Download Excel contains your saved workbook.");
-        setMessage(`Added ${{data.added}} row(s).${{failed}}${{downloadText}}`, data.errors && data.errors.length ? "error" : "success");
+        setMessage(`Added ${{data.added}} row(s).${{failed}}${{errorDetails}}${{downloadText}}`, uploadErrors.length ? "error" : "success");
         fileInput.value = "";
         folderInput.value = "";
         selectedFiles = [];

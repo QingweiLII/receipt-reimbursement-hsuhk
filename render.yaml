@@ -40,11 +40,11 @@ services:
       - key: OCR_VARIANTS
         value: gray
       - key: OCR_PSMS
-        value: 6
+        value: 6,11
       - key: OCR_TIMEOUT_SECONDS
         value: 20
       - key: OCR_MAX_CANDIDATES
-        value: 2
+        value: 3
       - key: STORAGE_PROVIDER
         value: user_google_drive
       - key: GOOGLE_DRIVE_FOLDER_NAME
@@ -52,7 +52,7 @@ services:
       - key: MAX_UPLOAD_MB
         value: 20
       - key: MAX_PARALLEL_RECEIPTS
-        value: 2
+        value: 1
       - key: UPLOAD_JOB_WORKERS
         value: 1
       - key: MAX_ACTIVE_UPLOAD_JOBS
