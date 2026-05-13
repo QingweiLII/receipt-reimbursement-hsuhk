@@ -33,10 +33,12 @@ RECORDS_PATH = DATA_DIR / "records.json"
 WORKBOOK_PATH = DATA_DIR / "reimbursements.xlsx"
 PAGE_PATHS = {"/", "/hsuhk-receipt-report-page", "/hsuhk receipt report page", "/hsuhk-receipt-report"}
 DEFAULT_OCR_TIMEOUT_SECONDS = "20"
-DEFAULT_OCR_TARGET_MIN_EDGE = "900"
-DEFAULT_OCR_MAX_LONG_EDGE = "2000"
+DEFAULT_OCR_TARGET_MIN_EDGE = "500"
+DEFAULT_OCR_MAX_LONG_EDGE = "900"
+DEFAULT_OCR_SMALL_MAX_LONG_EDGE = "650"
 DEFAULT_OCR_PSMS = "6"
 DEFAULT_OCR_MAX_CANDIDATES = "2"
+DEFAULT_OCR_VARIANTS = "gray"
 DEFAULT_LLM_TIMEOUT_SECONDS = "45"
 DEFAULT_RECEIPT_PROCESS_TIMEOUT_SECONDS = "120"
 
@@ -1532,10 +1534,30 @@ def read_pdf_ocr_text(path: Path) -> str:
 
 
 def run_tesseract(path: Path, psm: str | None = None) -> tuple[str, str, int]:
-    command = ["tesseract", str(path), "stdout", "-l", os.environ.get("OCR_LANG", "eng")]
+    command = [
+        "tesseract",
+        str(path),
+        "stdout",
+        "-l",
+        os.environ.get("OCR_LANG", "eng"),
+        "--oem",
+        os.environ.get("OCR_OEM", "1"),
+    ]
     if psm:
         command.extend(["--psm", psm])
+    dpi = os.environ.get("OCR_DPI", "150").strip()
+    if dpi:
+        command.extend(["--dpi", dpi])
+    config_values = os.environ.get(
+        "OCR_CONFIG",
+        "load_system_dawg=0,load_freq_dawg=0,tessedit_do_invert=0",
+    )
+    for item in config_values.split(","):
+        item = item.strip()
+        if item:
+            command.extend(["-c", item])
     try:
+        start = time.time()
         result = subprocess.run(
             command,
             check=False,
@@ -1547,6 +1569,12 @@ def run_tesseract(path: Path, psm: str | None = None) -> tuple[str, str, int]:
         raise ExtractionError("MiniMax provider needs local OCR for images, but tesseract is not installed.")
     except subprocess.TimeoutExpired:
         return "", "Local OCR timed out before the receipt text could be extracted.", 124
+    elapsed = time.time() - start
+    if elapsed >= 3 or result.returncode != 0:
+        print(
+            f"OCR finished in {elapsed:.1f}s with code {result.returncode} "
+            f"for {path.name} psm={psm or 'default'} chars={len(result.stdout.strip())}"
+        )
     return result.stdout.strip(), (result.stderr or "").strip(), result.returncode
 
 
@@ -1601,6 +1629,42 @@ def resize_for_ocr(image, target_min: int | None = None):
     return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
 
 
+def resize_to_max_long_edge(image, max_long: int):
+    max_edge = max(image.size)
+    if max_edge <= max_long:
+        return image
+    scale = max_long / max_edge
+    return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+
+
+def crop_for_ocr(image):
+    if not env_flag("OCR_CROP", True):
+        return image
+    try:
+        from PIL import ImageOps  # type: ignore
+    except Exception:
+        return image
+    gray = ImageOps.grayscale(image)
+    threshold = int(os.environ.get("OCR_CROP_THRESHOLD", "245"))
+    mask = gray.point(lambda pixel: 255 if pixel < threshold else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return image
+    left, top, right, bottom = bbox
+    if right <= left or bottom <= top:
+        return image
+    pad = max(8, int(max(image.size) * 0.025))
+    left = max(0, left - pad)
+    top = max(0, top - pad)
+    right = min(image.width, right + pad)
+    bottom = min(image.height, bottom + pad)
+    cropped_area = (right - left) * (bottom - top)
+    original_area = image.width * image.height
+    if cropped_area < original_area * 0.03:
+        return image
+    return image.crop((left, top, right, bottom))
+
+
 def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
     candidates: list[tuple[int, str, str]] = []
     raw_text = ""
@@ -1625,10 +1689,10 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
     except Exception:
         return candidates
 
-    base = resize_for_ocr(base)
+    base = resize_for_ocr(crop_for_ocr(base))
     enabled_variants = {
         item.strip().lower()
-        for item in os.environ.get("OCR_VARIANTS", "gray,rgb").split(",")
+        for item in os.environ.get("OCR_VARIANTS", DEFAULT_OCR_VARIANTS).split(",")
         if item.strip()
     }
     variants = []
@@ -1637,6 +1701,11 @@ def collect_ocr_candidates(path: Path) -> list[tuple[int, str, str]]:
         variants.append(("gray", gray))
     if "rgb" in enabled_variants:
         variants.append(("rgb", base))
+    if env_flag("OCR_SMALL_RETRY", True):
+        small_max = int(os.environ.get("OCR_SMALL_MAX_LONG_EDGE", DEFAULT_OCR_SMALL_MAX_LONG_EDGE))
+        if max(base.size) > small_max:
+            small = resize_to_max_long_edge(base, small_max)
+            variants.append(("gray-small", ImageOps.autocontrast(ImageOps.grayscale(small))))
 
     if base.width > base.height * 1.15:
         if "rot90" in enabled_variants or "rotations" in enabled_variants:
@@ -1686,6 +1755,7 @@ def read_image_text(path: Path) -> str:
         candidates = dedupe_ocr_candidates(collect_ocr_candidates(path))
         if candidates:
             return format_ocr_candidates(candidates)
+        raise ExtractionError("Local OCR failed: no readable text was extracted from the receipt image.")
 
     text, details, code = run_tesseract(path)
     if code != 0:
@@ -3494,6 +3564,9 @@ def serve() -> None:
     print(
         "Runtime timeouts: "
         f"OCR_TIMEOUT_SECONDS={os.environ.get('OCR_TIMEOUT_SECONDS', DEFAULT_OCR_TIMEOUT_SECONDS)} "
+        f"OCR_MAX_LONG_EDGE={os.environ.get('OCR_MAX_LONG_EDGE', DEFAULT_OCR_MAX_LONG_EDGE)} "
+        f"OCR_SMALL_MAX_LONG_EDGE={os.environ.get('OCR_SMALL_MAX_LONG_EDGE', DEFAULT_OCR_SMALL_MAX_LONG_EDGE)} "
+        f"OCR_VARIANTS={os.environ.get('OCR_VARIANTS', DEFAULT_OCR_VARIANTS)} "
         f"OCR_PSMS={os.environ.get('OCR_PSMS', DEFAULT_OCR_PSMS)} "
         f"OCR_MAX_CANDIDATES={os.environ.get('OCR_MAX_CANDIDATES', DEFAULT_OCR_MAX_CANDIDATES)} "
         f"LLM_TIMEOUT_SECONDS={os.environ.get('LLM_TIMEOUT_SECONDS', DEFAULT_LLM_TIMEOUT_SECONDS)} "

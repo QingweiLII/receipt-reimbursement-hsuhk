@@ -30,9 +30,15 @@ services:
       - key: FX_LOOKBACK_DAYS
         value: 7
       - key: OCR_TARGET_MIN_EDGE
-        value: 900
+        value: 500
       - key: OCR_MAX_LONG_EDGE
-        value: 2000
+        value: 900
+      - key: OCR_SMALL_MAX_LONG_EDGE
+        value: 650
+      - key: OCR_SMALL_RETRY
+        value: true
+      - key: OCR_VARIANTS
+        value: gray
       - key: OCR_PSMS
         value: 6
       - key: OCR_TIMEOUT_SECONDS
