@@ -2295,6 +2295,7 @@ def upload_job_snapshot(job: dict) -> dict:
     keys = [
         "id",
         "client_id",
+        "request_id",
         "status",
         "created_at",
         "updated_at",
@@ -2502,8 +2503,14 @@ def start_upload_job(
     client_id: str,
     drive_session: dict | None,
 ) -> str:
+    request_id = safe_client_id(fields.get("upload_request_id")) if fields.get("upload_request_id", "").strip() else ""
+    safe_id = safe_client_id(client_id)
     with UPLOAD_JOBS_LOCK:
         cleanup_upload_jobs_unlocked()
+        if request_id:
+            for existing_id, job in UPLOAD_JOBS.items():
+                if job.get("client_id") == safe_id and job.get("request_id") == request_id:
+                    return existing_id
         active_count = sum(1 for job in UPLOAD_JOBS.values() if job.get("status") not in TERMINAL_UPLOAD_STATUSES)
         if active_count >= max_active_upload_jobs():
             raise ExtractionError("The upload server is busy. Please try again in a moment.")
@@ -2511,7 +2518,8 @@ def start_upload_job(
         now = now_local()
         UPLOAD_JOBS[job_id] = {
             "id": job_id,
-            "client_id": safe_client_id(client_id),
+            "client_id": safe_id,
+            "request_id": request_id,
             "status": "queued",
             "created_at": now,
             "updated_at": now,
@@ -2971,6 +2979,40 @@ def page_html() -> bytes:
       }}
     }}
 
+    function uploadRequestId() {{
+      return crypto.randomUUID ? crypto.randomUUID() : `${{Date.now()}}-${{Math.random().toString(16).slice(2)}}`;
+    }}
+
+    function buildUploadForm(requestId) {{
+      const form = new FormData();
+      for (const file of selectedFiles) form.append("files", file, file.webkitRelativePath || file.name);
+      form.append("drive_file_ids", JSON.stringify(Array.from(selectedDriveFiles.keys())));
+      form.append("save_mode", document.querySelector('input[name="saveMode"]:checked').value);
+      form.append("upload_request_id", requestId);
+      return form;
+    }}
+
+    async function startUploadWithRetry(requestId) {{
+      let lastError;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {{
+        try {{
+          const res = await fetch("/api/upload", {{
+            method: "POST",
+            headers: headers(),
+            body: buildUploadForm(requestId),
+            cache: "no-store",
+          }});
+          return await readJsonResponse(res);
+        }} catch (error) {{
+          lastError = error;
+          if (attempt === 3) break;
+          setMessage(`Upload connection interrupted. Retrying... (${{attempt}}/3)`);
+          await sleep(1500 * attempt);
+        }}
+      }}
+      throw new Error(lastError?.message || "Upload failed before the server returned a job id.");
+    }}
+
     function formatBytes(bytes) {{
       if (!bytes) return "0 B";
       const units = ["B", "KB", "MB", "GB"];
@@ -3140,12 +3182,7 @@ def page_html() -> bytes:
       uploadButton.disabled = true;
       setMessage(`Processing ${{totalSelectedCount()}} file(s)...`);
       try {{
-        const form = new FormData();
-        for (const file of selectedFiles) form.append("files", file, file.webkitRelativePath || file.name);
-        form.append("drive_file_ids", JSON.stringify(Array.from(selectedDriveFiles.keys())));
-        form.append("save_mode", document.querySelector('input[name="saveMode"]:checked').value);
-        const res = await fetch("/api/upload", {{ method: "POST", headers: headers(), body: form }});
-        const started = await readJsonResponse(res);
+        const started = await startUploadWithRetry(uploadRequestId());
         const data = started.job_id ? await pollUploadJob(started.job_id) : started;
         if (!data.ok) throw new Error(data.error || "Upload failed.");
         latestBatchId = data.batch_id || "";
