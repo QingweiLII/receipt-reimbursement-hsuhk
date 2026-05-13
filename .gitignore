@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+data/
+uploads/
+*.xlsx
+Receipt website_code_for_review.py
+Receipt website_code_for_review.py.zip

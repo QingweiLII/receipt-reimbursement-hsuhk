@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+data/
+uploads/
+*.xlsx
+website_code_for_review.py
+.DS_Store

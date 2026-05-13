@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: hsuhk-receipt-report-page
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: LLM_PROVIDER
+        value: minimax
+      - key: LLM_BASE_URL
+        value: https://api.minimaxi.com/anthropic
+      - key: LLM_MODEL
+        value: MiniMax-M2.7
+      - key: LLM_MAX_TOKENS
+        value: 2500
+      - key: EXCHANGE_RATE_PROVIDER
+        value: frankfurter
+      - key: FX_BASE_URL
+        value: https://api.frankfurter.dev/v2
+      - key: FX_LOOKBACK_DAYS
+        value: 7
+      - key: STORAGE_PROVIDER
+        value: user_google_drive
+      - key: GOOGLE_DRIVE_FOLDER_NAME
+        value: HSUHK Receipt Reports
+      - key: MAX_UPLOAD_MB
+        value: 20
+      - key: MAX_PARALLEL_RECEIPTS
+        value: 10
+      - key: MAX_FILES_PER_UPLOAD
+        value: 10
+      - key: LLM_API_KEY
+        sync: false
